@@ -1,0 +1,281 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from statsmodels.graphics.tsaplots import plot_acf
+
+# --- Load Data ---
+df = pd.read_excel("DATA.xlsx")
+df['Date'] = pd.to_datetime(df['Date'])
+df = df.sort_values('Date')
+df['date'] = df['Date'].dt.date
+df['time_bin'] = df['Date'].dt.time
+
+# Plot 5 lines: OHLC + VWAP
+plt.figure(figsize=(12,6))
+plt.plot(df['Date'], df['High'], label='High', linewidth=1.5, color='green')
+plt.plot(df['Date'], df['Low'], label='Low', linewidth=1.5, color='red')
+plt.plot(df['Date'], df['VWAP'], label='VWAP', linewidth=2, color='black', linestyle=':')
+plt.xticks(rotation=45)
+plt.xlabel("Time")
+plt.ylabel("Price")
+plt.title("Intraday Prices and VWAP")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Compute 10-minute log returns from Close
+df['ret'] = np.log(df['Close']).diff()
+df = df.dropna()
+
+# Realized volatility & trading volume per time-bin per day
+vol_per_bin = df.groupby(['date', 'time_bin'])['ret'].apply(lambda x: np.sqrt((x**2).sum()))
+volume_per_bin = df.groupby(['date', 'time_bin'])['Size'].sum()
+
+# average across days to get the diurnal pattern
+vol_pattern = vol_per_bin.groupby('time_bin').mean()
+volume_pattern = volume_per_bin.groupby('time_bin').mean()
+
+# Normalize for comparability
+pattern_table = pd.DataFrame({
+    'Relative_Volatility': vol_pattern / vol_pattern.mean(),
+    'Relative_Volume': volume_pattern / volume_pattern.mean()
+}).reset_index()
+
+# Relative volatility factor (diurnal pattern)
+vol_pattern = vol_per_bin.groupby('time_bin').mean()
+vol_factor = vol_pattern / vol_pattern.mean()
+diurnal_factor = vol_pattern / vol_pattern.mean()
+print(diurnal_factor)
+
+# CV to quantify diurnal effect strength
+cv = vol_factor.std() / vol_factor.mean()
+print("Coefficient of Variation of diurnal volatility pattern:", cv)
+
+# Plot the pattern
+pattern_table['time_str'] = pattern_table['time_bin'].astype(str)
+plt.figure(figsize=(10,5))
+plt.plot(pattern_table['time_str'], pattern_table['Relative_Volatility'], label='Volatility', linewidth=2)
+plt.plot(pattern_table['time_str'], pattern_table['Relative_Volume'], '--', label='Volume', linewidth=2)
+tick_positions = np.arange(0, len(pattern_table), 6)
+plt.xticks(tick_positions, pattern_table['time_str'].iloc[tick_positions], rotation=45)
+plt.title("Diurnal Pattern (10-min Data, 1h Axis Ticks)")
+plt.ylabel("Relative Level")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Deseasonalize returns using the diurnal volatility factor
+vol_factor = vol_pattern / vol_pattern.mean()  # already in pattern_table, can reuse
+df['ret_adj'] = df.apply(lambda row: row['ret'] / vol_factor[row['time_bin']], axis=1)
+
+# Volatility estimation
+
+# 1. --- Realized Variance (RV) ---
+rv_daily = df.groupby('date')['ret_adj'].apply(lambda x: np.sum(x**2))
+
+# Realized Bipower Variation (jump-robust measure)
+mu1 = np.sqrt(2/np.pi)
+bpv = (mu1**-2) * (np.abs(df['ret_adj']).shift(1) * np.abs(df['ret_adj'])).sum()
+rv = (df['ret_adj']**2).sum()
+jump_var = max(rv - bpv, 0)
+
+# 3. --- Bartlett Kernel (Realized Kernel Estimator) ---
+def realized_kernel(returns, bandwidth=10):
+    r = returns - returns.mean()
+    T = len(r)
+    w = lambda k, b: 1 - abs(k) / (b + 1)
+    rk = 0
+    for k in range(-bandwidth, bandwidth + 1):
+        cov = np.sum(r[max(0, -k):min(T, T - k)] * r[max(0, k):min(T, T + k)])
+        rk += w(k, bandwidth) * cov
+    return rk
+
+rk_daily = df.groupby('date')['ret_adj'].apply(lambda x: realized_kernel(x.values, bandwidth=10))
+
+# 4. --- Zhang–Bollerslev Two-Scale Realized Variance (TSRV) ---
+def tsrv(returns, K=10):
+    n = len(returns)
+    if n <= K:
+        return np.nan
+    logp = np.concatenate([[0.], np.cumsum(returns)])  # reconstruct log-prices
+    diffs = logp[K:] - logp[:-K]
+    rv_fast = np.sum(diffs**2) / K
+    rv_all = np.sum(returns**2)
+    nbar = (n - K + 1) / K
+    tsrv_val = rv_fast - (nbar / n) * rv_all
+    return tsrv_val
+
+tsrv_daily = df.groupby('date')['ret_adj'].apply(lambda x: tsrv(x.values, K=10))
+
+# 5. --- Combine and compare ---
+comparison = pd.DataFrame({
+    'RV': rv_daily,
+    'BPV': bpv_daily,
+    'JumpVar': jump_var,
+    'RK_Bartlett': rk_daily,
+    'TSRV_ZhangBollerslev': tsrv_daily
+})
+
+# normalize for comparison
+comparison_norm = comparison.div(comparison.mean())
+
+print(comparison.round(6))
+print("\nNormalized comparison:")
+print(comparison_norm.round(3))
+
+import matplotlib.pyplot as plt
+
+# --- Plot Comparison of Volatility Estimators ---
+plt.figure(figsize=(12,6))
+plt.plot(comparison.index, comparison['RV'], label='RV (Raw)', linewidth=1.5, color='gray')
+plt.plot(comparison.index, comparison['BPV'], label='BPV (Jump-robust)', linewidth=1.5, color='green')
+plt.plot(comparison.index, comparison['RK_Bartlett'], label='Bartlett Kernel (Noise-robust)', linewidth=2, color='blue')
+plt.plot(comparison.index, comparison['TSRV_ZhangBollerslev'], label='TSRV (Noise-robust)', linewidth=2, color='orange')
+plt.plot(comparison.index, comparison['JumpVar'], label='Jump Variance', linewidth=1.5, linestyle='--', color='red')
+
+plt.title("Comparison of Realized Volatility Estimators")
+plt.xlabel("Date")
+plt.ylabel("Variance Estimate")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# --- Volatility Signature Plot (averaged across days) ---
+
+def realized_var_from_sampling(subdf, freq):
+    """Compute realized variance per day with given sampling frequency."""
+    subdf = subdf.copy()
+    results = []
+    for d, x in subdf.groupby('date'):
+        n = len(x)
+        if n >= freq:
+            sampled = x['ret_adj'].iloc[::freq].values
+            results.append(np.sum(sampled**2))
+    return np.nanmean(results)
+
+freq_list = [1, 2, 3, 5, 10, 15, 20, 30]
+rv_by_freq = [realized_var_from_sampling(df, f) for f in freq_list]
+
+plt.figure(figsize=(8,5))
+plt.plot(freq_list, rv_by_freq, marker='o', linewidth=2)
+plt.title("Average Volatility Signature Plot (all days)")
+plt.xlabel("Sampling step (skip factor)")
+plt.ylabel("Mean Realized Variance")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# --- Validation of Realized Volatility Estimates ---
+
+print("\n--- VALIDATION CHECKS ---")
+
+# 1. Histogram of returns
+print("\nBasic stats of deseasonalized returns:")
+print(df['ret_adj'].describe())
+plt.figure(figsize=(6,4))
+plt.hist(df['ret_adj'], bins=100, edgecolor='black', alpha=0.7)
+plt.title("Histogram of Deseasonalized Returns")
+plt.xlabel("ret_adj")
+plt.ylabel("Frequency")
+plt.tight_layout()
+plt.show()
+
+# 2. Internal consistency: re-aggregate RV per day and compare
+check_rv = df.groupby('date')['ret_adj'].apply(lambda x: np.sum(x**2))
+diff = (check_rv - comparison['RV']).abs().max()
+print(f"\nMax absolute difference between recomputed and stored RV: {diff:.3e}")
+if diff < 1e-8:
+    print("✔ RV aggregation internally consistent.")
+else:
+    print("⚠ Check possible grouping or rounding issue.")
+
+# 3. Compare estimators summary
+print("\nEstimator comparison summary:")
+print(comparison.describe()[['RV','BPV','RK_Bartlett','TSRV_ZhangBollerslev','JumpVar']].T)
+
+# 4. Correlation matrix of estimators
+corr = comparison[['RV','BPV','RK_Bartlett','TSRV_ZhangBollerslev']].corr()
+print("\nPairwise correlations between estimators:")
+print(corr.round(3))
+
+# 5. Rolling stability check
+plt.figure(figsize=(10,4))
+plt.plot(comparison.index, comparison['RV'].rolling(5).mean(), label='RV (5-day MA)', color='gray')
+plt.plot(comparison.index, comparison['BPV'].rolling(5).mean(), label='BPV (5-day MA)', color='green')
+plt.plot(comparison.index, comparison['TSRV_ZhangBollerslev'].rolling(5).mean(), label='TSRV (5-day MA)', color='orange')
+plt.plot(comparison.index, comparison['RK_Bartlett'].rolling(5).mean(), label='Bartlett Kernel (5-day MA)', color='blue')
+plt.title("Rolling 5-Day Mean of Volatility Estimators")
+plt.xlabel("Date")
+plt.ylabel("Variance (5-day mean)")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 6. Vol signature recheck (summary)
+print("\nSignature plot interpretation:")
+print("- Declining curve at high frequency → microstructure noise present.")
+print("- Plateau region → true integrated variance scale.")
+print("- If curve rises again → irregular sampling or timestamp drift.")
+
+# 7. Jump detection significance (Barndorff-Nielsen & Shephard test)
+comparison['Z_jump'] = (comparison['RV'] - comparison['BPV']) / np.sqrt(2 * (comparison['BPV']**2 / len(df)))
+comparison['Jump_sig'] = (abs(comparison['Z_jump']) > 3)
+jump_days = comparison['Jump_sig'].sum()
+print(f"\nSignificant jump days (|Z|>3): {jump_days}")
+
+# 8. Distribution of standardized returns
+df_daily = df.groupby('date')['ret_adj'].sum()
+std_daily = np.sqrt(comparison['RV'])
+std_returns = df_daily / std_daily
+print("\nStandardized daily returns stats:")
+print(std_returns.describe())
+
+#9. Normality test (Jarque–Bera)
+jb_stat, jb_p = stats.jarque_bera(std_returns.dropna())
+print(f"Jarque–Bera test: JB={jb_stat:.2f}, p={jb_p:.4f}")
+if jb_p < 0.05:
+    print("⚠ Standardized returns deviate from normality.")
+else:
+    print("✔ Standardized returns roughly normal.")
+
+# 10. Autocorrelation diagnostics
+plt.figure(figsize=(10,4))
+plot_acf(comparison['RV'], lags=20)
+plt.title("ACF of Realized Variance")
+plt.tight_layout()
+plt.show()
+plt.figure(figsize=(10,4))
+plot_acf(comparison['RV'].diff().dropna(), lags=20)
+plt.title("ACF of ΔRealized Variance")
+plt.tight_layout()
+plt.show()
+
+# --- RMSE Evaluation of Volatility Estimators ---
+print("\n--- RMSE Evaluation ---")
+
+# Choose reference estimator (usually naive RV)
+ref = comparison['RV']
+
+# Compute RMSE for each alternative estimator
+rmse_table = pd.DataFrame({
+    'Estimator': ['BPV', 'RK_Bartlett', 'TSRV_ZhangBollerslev'],
+    'RMSE': [
+        np.sqrt(np.mean((comparison['BPV'] - ref)**2)),
+        np.sqrt(np.mean((comparison['RK_Bartlett'] - ref)**2)),
+        np.sqrt(np.mean((comparison['TSRV_ZhangBollerslev'] - ref)**2))
+    ]
+})
+
+# Also compare against the mean of all estimators as a composite benchmark
+benchmark = comparison[['RV','BPV','RK_Bartlett','TSRV_ZhangBollerslev']].mean(axis=1)
+rmse_table.loc[len(rmse_table.index)] = [
+    'vs Mean Benchmark',
+    np.sqrt(np.mean((comparison['RV'] - benchmark)**2))
+]
+
+print(rmse_table.to_string(index=False))
